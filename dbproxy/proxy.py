@@ -54,6 +54,8 @@ class ProxyServer:
                 self._active = False
                 break
 
+            time.sleep(constants.SERVER_CONNECTIONS_EVERY)
+
         self._socket.close()
 
     @staticmethod
@@ -75,7 +77,6 @@ class ProxyServer:
                 if not data:
                     break
                 data_buffer += data
-
         except:
             pass
 

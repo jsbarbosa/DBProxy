@@ -1,143 +1,128 @@
-import threading
+from socketserver import BaseRequestHandler, TCPServer, StreamRequestHandler, ForkingTCPServer
 import socket
-import time
-import logging
 from . import constants
+import logging
+from typing import Union
+import time
 
 logger = logging.getLogger(__name__)
 
 
-class ProxyServer:
+class SockHandler(BaseRequestHandler):
+    """
+    Request Handler for the proxy server.
+    Instantiated once time for each connection, and must
+    override the handle() method for client communication.
+    """
+
+    def setup(self):
+        self._host = self.server._remote_host
+        self._port = self.server._remote_port
+
+        self.request.settimeout(constants.PROXY_SOCKET_READ_TIMEOUT)
+        self.request.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, constants.PROXY_SOCKET_KEEPALIVE)
+#        self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, constants.PROXY_SOCKET_KEEPIDLE)
+        self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, constants.PROXY_SOCKET_KEEPINTVL)
+        self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, constants.PROXY_KEEPCNT)
+
+        self.request.setblocking(0)  # make socket non blocking
+        logger.info(f"SockHandler setup to '{self._host}:{self._port}'")
+
+    @staticmethod
+    def get_data(socket: socket.socket):
+        total_data = []  # total data partwise in an array
+
+        begin = time.time() # beginning time
+
+        while True:
+            # if you got some data, then break after timeout
+            if total_data and time.time() - begin > constants.PROXY_SOCKET_READ_TIMEOUT:
+                break
+
+            # if you got no data at all, wait a little longer, twice the timeout
+            elif time.time() - begin > constants.PROXY_SOCKET_READ_TIMEOUT * 2:
+                break
+
+            # recv something
+            try:
+                data = socket.recv(constants.PROXY_SOCKET_READ_BYTE_SIZE)
+                if data:
+                    total_data.append(data)
+                    # change the beginning time for measurement
+                    begin = time.time()
+                else:
+                    # sleep for sometime to indicate a gap
+                    time.sleep(0.1)
+            except OSError:
+                pass
+
+        # join all parts to make final string
+        return b''.join(total_data)
+
+    @staticmethod
+    def write_data(socket: socket.socket, data: bytes):
+        for i in range(0, len(data), constants.PROXY_SOCKET_READ_BYTE_SIZE):
+            temp = data[i: i + constants.PROXY_SOCKET_READ_BYTE_SIZE]
+            socket.send(
+                temp
+            )
+
+    def handle(self):
+        data = self.get_data(self.request)
+
+        # self.request is the TCP socket connected to the client
+        logging.info("Passing data from: {}".format(self.client_address[0]))
+        logging.info(data)
+
+        if data:
+            # Create a socket to the localhost server
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setblocking(0)
+            sock.settimeout(constants.PROXY_SOCKET_READ_TIMEOUT)
+
+            # Try to connect to the server and send data
+            try:
+                sock.connect((self._host, self._port))
+                sock.sendall(data)
+
+                while True:
+                    # Receive data from the server
+                    from_server = self.get_data(sock)
+                    logging.info("From server")
+                    logging.info(from_server)
+                    if from_server:
+                        self.request.sendall(from_server)
+                    else:
+                        break
+            finally:
+                sock.close()
+
+
+class TCPProxy(TCPServer):
     def __init__(
             self,
             local_host: str,
-            local_port: int,
+            local_port: Union[int, str],
             remote_host: str,
-            remote_port: int,
-            auto_start: bool = True
+            remote_port: Union[int, str],
+            *args,
+            **kwargs
     ):
-        self._local_host = local_host
-        self._local_port = int(local_port)
         self._remote_host = remote_host
         self._remote_port = int(remote_port)
 
-        self._socket = self._create_socket()
-        self._active = False
-        if auto_start:
-            self.start_server()
+        super(TCPProxy, self).__init__(
+            (local_host, int(local_port)),
+            SockHandler,
+            *args,
+            bind_and_activate=True,
+            **kwargs
+        )
 
-    def _create_socket(self):
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.bind((self._local_host, self._local_port))
-        server_socket.listen(5)
+        logger.info(f"TCP Proxy started on '{local_host}:{local_port}'")
 
-        logger.info(f"[*] TCP proxy listening on {self._local_host}:{server_socket.getsockname()[1]}")
-        return server_socket
-
-    def start_server(self):
-        self._active = True
-
-        while True:
-            try:
-                client_socket, addr = self._socket.accept()
-                logger.info(f"[==>] Incoming tcp connection from client: {addr[0]}:{addr[1]}")
-
-                proxy_thread = threading.Thread(
-                    target=self.handler,
-                    args=(
-                        client_socket,
-                    )
-                )
-
-                proxy_thread.start()
-            except KeyboardInterrupt:
-                self._active = False
-                break
-
-            time.sleep(constants.SERVER_CONNECTIONS_EVERY)
-
-        self._socket.close()
-
-    @staticmethod
-    def receive_from(
-            socket: socket.socket,
-            timeout: int = constants.PROXY_SOCKET_READ_TIMEOUT,
-            byte_size: int = constants.PROXY_SOCKET_READ_BYTE_SIZE
-    ):
-        # helper function to receive the complete data buffer
-
-        data_buffer = b""
+    def serve_forever(self, *args, **kwargs):
         try:
-            # set connection timeout. Adjust as necessary
-            socket.settimeout(timeout)
-
-            # Keep receiving byte_size bytes of data until no more
-            while True:
-                data = socket.recv(byte_size)
-                if not data:
-                    break
-                data_buffer += data
-        except:
-            pass
-
-        return data_buffer
-
-    @staticmethod
-    def request_handler(buffer, from_client: bool):
-        # placeholder function to modify request buffer
-        print(buffer)
-        print()
-        return buffer
-
-    def receive_send_data(self, from_socket: socket.socket, to_socket: socket.socket, from_client: bool) -> int:
-        # receive data from client
-        local_buffer = self.receive_from(from_socket)
-
-        # send request to remotehost and reset timer
-        if len(local_buffer):
-            if from_client:
-                from_ = 'client'
-                to_ = 'remote'
-            else:
-                from_ = 'remote'
-                to_ = 'client'
-
-            logging.info(
-                f"[==>] Sending {len(local_buffer)} bytes from {from_} to {to_}"
-            )
-
-            # modify request buffer if necessary
-            local_buffer = self.request_handler(local_buffer, from_client)
-
-            to_socket.sendall(local_buffer)
-
-            return len(local_buffer)
-
-        return 0
-
-    def handler(self, client_socket, receive_first=False):
-        connection_time = time.time()
-
-        # create the remote socket
-        remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-        # connect to remotehost with remote socket
-        remote_socket.connect((self._remote_host, self._remote_port))
-
-        # receive data from remote host
-        if receive_first:
-            if self.receive_send_data(remote_socket, remote_socket):
-                connection_time = time.time()
-
-        while self._active:
-            if self.receive_send_data(client_socket, remote_socket, True):
-                connection_time = time.time()
-            if self.receive_send_data(remote_socket, remote_socket, False):
-                connection_time = time.time()
-
-            # check if more than constants.PROXY_SOCKET_IDDLE_TIMEOUT secs has elapsed on an idle socket connection
-            if (time.time() - connection_time > constants.PROXY_SOCKET_IDDLE_TIMEOUT) or (not self._active):
-                client_socket.close()
-                remote_socket.close()
-                logging.info("[*] No more data. Closing connections")
-                break
+            super(TCPProxy, self).serve_forever(*args, **kwargs)
+        except KeyboardInterrupt:
+            self.shutdown()
